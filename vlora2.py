@@ -77,7 +77,9 @@ def _load_audio(path: str) -> Tuple[torch.Tensor, int]:
 
     Prefers the `soundfile` backend to avoid torchcodec/FFmpeg DLL issues;
     falls back to torchaudio's default loader if soundfile isn't installed
-    or fails to load a given file.
+    or fails to load a given file. Raises if the file is genuinely
+    unreadable/corrupt so callers can decide how to handle it (see
+    `_safe_getitem_with_retry` below, used by both dataset classes).
     """
     if _HAS_SOUNDFILE:
         try:
@@ -87,6 +89,26 @@ def _load_audio(path: str) -> Tuple[torch.Tensor, int]:
         except Exception:
             pass  # fall through to torchaudio
     return torchaudio.load(path)
+
+
+def _safe_getitem_with_retry(files: list, idx: int, sample_rate: int, segment_len: int,
+                              max_retries: int = 10) -> torch.Tensor:
+    """Load files[idx], preprocessed; on failure (corrupt/truncated audio),
+    retry with a different random index instead of crashing the whole
+    training run over one bad file out of tens of thousands."""
+    tried = idx
+    for attempt in range(max_retries):
+        path = files[tried]
+        try:
+            wav, sr = _load_audio(path)
+            return _preprocess_wav(wav, sr, sample_rate, segment_len)
+        except Exception as e:
+            print(f"WARNING: failed to load '{path}' ({e}); skipping and trying another file.")
+            tried = random.randint(0, len(files) - 1)
+    raise RuntimeError(
+        f"Failed to load a valid audio file after {max_retries} attempts starting from "
+        f"index {idx}. Too many corrupt files in the dataset, or something else is wrong."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -464,6 +486,83 @@ class MultiResolutionSTFTLoss(nn.Module):
         return loss / len(self.fft_sizes)
 
 
+class ScaleDiscriminator(nn.Module):
+    """A single-scale waveform discriminator (regular, non-ternary convs --
+    this network is thrown away after training, it's only there to sharpen
+    the codec's outputs, so it doesn't need to be tiny)."""
+
+    def __init__(self):
+        super().__init__()
+        wn = nn.utils.parametrizations.weight_norm
+        self.convs = nn.ModuleList([
+            wn(nn.Conv1d(1, 32, 15, stride=1, padding=7)),
+            wn(nn.Conv1d(32, 64, 41, stride=4, padding=20, groups=4)),
+            wn(nn.Conv1d(64, 128, 41, stride=4, padding=20, groups=16)),
+            wn(nn.Conv1d(128, 256, 41, stride=4, padding=20, groups=16)),
+            wn(nn.Conv1d(256, 256, 41, stride=4, padding=20, groups=16)),
+            wn(nn.Conv1d(256, 256, 5, stride=1, padding=2)),
+        ])
+        self.out = wn(nn.Conv1d(256, 1, 3, stride=1, padding=1))
+
+    def forward(self, x: torch.Tensor):
+        feats = []
+        for conv in self.convs:
+            x = F.leaky_relu(conv(x), 0.1)
+            feats.append(x)
+        x = self.out(x)
+        feats.append(x)
+        return x, feats
+
+
+class MultiScaleDiscriminator(nn.Module):
+    """Three ScaleDiscriminators looking at the waveform at 1x, 2x, 4x
+    downsampled resolutions (standard MelGAN/HiFi-GAN-style setup)."""
+
+    def __init__(self):
+        super().__init__()
+        self.discriminators = nn.ModuleList(
+            [ScaleDiscriminator() for _ in range(3)]
+        )
+        self.pool = nn.AvgPool1d(4, stride=2, padding=2)
+
+    def forward(self, x: torch.Tensor):
+        outputs = []
+        for i, d in enumerate(self.discriminators):
+            if i != 0:
+                x = self.pool(x)
+            outputs.append(d(x))
+        return outputs  # list of (score, feats) per scale
+
+
+def discriminator_loss(real_outputs, fake_outputs) -> torch.Tensor:
+    """LSGAN-style: real -> 1, fake -> 0."""
+    loss = 0.0
+    for (real_score, _), (fake_score, _) in zip(real_outputs, fake_outputs):
+        loss = loss + torch.mean((real_score - 1) ** 2) + torch.mean(fake_score ** 2)
+    return loss / len(real_outputs)
+
+
+def generator_adversarial_loss(fake_outputs) -> torch.Tensor:
+    """LSGAN-style generator loss: push fake -> 1."""
+    loss = 0.0
+    for fake_score, _ in fake_outputs:
+        loss = loss + torch.mean((fake_score - 1) ** 2)
+    return loss / len(fake_outputs)
+
+
+def feature_matching_loss(real_outputs, fake_outputs) -> torch.Tensor:
+    """L1 distance between discriminator intermediate features for real vs
+    fake audio -- encourages the generator to match real audio's texture/
+    statistics at multiple scales, a major factor in reducing 'blurriness'."""
+    loss = 0.0
+    n = 0
+    for (_, real_feats), (_, fake_feats) in zip(real_outputs, fake_outputs):
+        for rf, ff in zip(real_feats, fake_feats):
+            loss = loss + F.l1_loss(ff, rf.detach())
+            n += 1
+    return loss / max(n, 1)
+
+
 # --------------------------------------------------------------------------
 # Dataset
 # --------------------------------------------------------------------------
@@ -486,10 +585,7 @@ class AudioFolderDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        path = self.files[idx]
-        wav, sr = _load_audio(path)
-        wav = _preprocess_wav(wav, sr, self.sample_rate, self.segment_len)
-        return wav
+        return _safe_getitem_with_retry(self.files, idx, self.sample_rate, self.segment_len)
 
 
 class LibriTTSDataset(Dataset):
@@ -553,8 +649,7 @@ class LibriTTSDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        wav, sr = _load_audio(self.files[idx])
-        return _preprocess_wav(wav, sr, self.sample_rate, self.segment_len)
+        return _safe_getitem_with_retry(self.files, idx, self.sample_rate, self.segment_len)
 
 
 def _preprocess_wav(wav: torch.Tensor, sr: int, target_sr: int, segment_len: int) -> torch.Tensor:
@@ -577,9 +672,32 @@ def _preprocess_wav(wav: torch.Tensor, sr: int, target_sr: int, segment_len: int
 # Training loop
 # --------------------------------------------------------------------------
 
+def _strip_or_add_compile_prefix(state_dict: dict, model: nn.Module) -> dict:
+    """torch.compile() wraps modules such that their state_dict keys gain an
+    '_orig_mod.' prefix in some torch versions. When resuming a checkpoint
+    saved with a different --compile setting than the current run, the key
+    prefixes can mismatch; this adds/strips the prefix as needed so resume
+    works regardless of whether --compile was used then vs. now."""
+    model_has_prefix = any(k.startswith("_orig_mod.") for k in model.state_dict().keys())
+    ckpt_has_prefix = any(k.startswith("_orig_mod.") for k in state_dict.keys())
+    if model_has_prefix and not ckpt_has_prefix:
+        return {f"_orig_mod.{k}": v for k, v in state_dict.items()}
+    if ckpt_has_prefix and not model_has_prefix:
+        return {k[len("_orig_mod."):]: v for k, v in state_dict.items()}
+    return state_dict
+
+
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)
+
+    # cudnn autotuner picks the fastest conv algorithm for your fixed input
+    # shapes after a few warmup steps -- free speedup for fixed-size batches.
+    torch.backends.cudnn.benchmark = True
+    # Allow TF32 on Ampere+ GPUs: much faster matmul/conv with negligible
+    # precision loss, off by default in older torch versions.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     strides = [int(s) for s in args.strides.split(",")]
     cfg = CodecConfig(
@@ -595,6 +713,14 @@ def train(args):
 
     n_params = sum(p.numel() for p in model.parameters())
     n_ternary = model.num_ternary_params()
+
+    if args.compile:
+        try:
+            model = torch.compile(model)
+            print("torch.compile enabled.")
+        except Exception as e:
+            print(f"torch.compile failed to enable ({e}); continuing without it.")
+
     approx_bits = n_ternary * math.log2(3) + (n_params - n_ternary) * 32
     print(f"Total params:            {n_params:,}")
     print(f"Ternary-quantized params: {n_ternary:,} ({n_ternary / n_params:.1%})")
@@ -618,12 +744,25 @@ def train(args):
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, drop_last=True, pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=(4 if args.num_workers > 0 else None),
     )
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(loader))
     stft_loss_fn = MultiResolutionSTFTLoss().to(device)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+
+    discriminator = None
+    opt_d = None
+    scaler_d = None
+    if args.use_gan:
+        discriminator = MultiScaleDiscriminator().to(device)
+        opt_d = torch.optim.AdamW(discriminator.parameters(), lr=args.disc_lr, betas=(0.5, 0.9))
+        scaler_d = torch.cuda.amp.GradScaler(enabled=args.amp)
+        n_disc_params = sum(p.numel() for p in discriminator.parameters())
+        print(f"GAN training enabled. Discriminator params: {n_disc_params:,} "
+              f"(thrown away after training -- doesn't affect deployed codec size)")
 
     start_epoch = 0
     step = 0
@@ -638,13 +777,17 @@ def train(args):
         except AttributeError:
             pass  # older torch versions don't have add_safe_globals; fall back below
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(_strip_or_add_compile_prefix(ckpt["model"], model))
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
         if "scaler" in ckpt and args.amp:
             scaler.load_state_dict(ckpt["scaler"])
+        if args.use_gan and "discriminator" in ckpt and discriminator is not None:
+            discriminator.load_state_dict(ckpt["discriminator"])
+            if "opt_d" in ckpt:
+                opt_d.load_state_dict(ckpt["opt_d"])
         start_epoch = ckpt.get("epoch", -1) + 1
         step = ckpt.get("step", 0)
         print(f"Resumed at epoch {start_epoch}, step {step}")
@@ -656,7 +799,8 @@ def train(args):
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        running = {"recon": 0.0, "stft": 0.0, "vq": 0.0, "total": 0.0}
+        running = {"recon": 0.0, "stft": 0.0, "vq": 0.0, "total": 0.0,
+                   "d_loss": 0.0, "g_adv": 0.0, "feat": 0.0}
         for wav in loader:
             wav = wav.to(device, non_blocking=True)
 
@@ -670,6 +814,33 @@ def train(args):
                     + args.vq_weight * vq_loss
                 )
 
+            d_loss_val = 0.0
+            g_adv_val = 0.0
+            feat_val = 0.0
+            if args.use_gan:
+                # --- discriminator step (separate from generator step) ---
+                with torch.cuda.amp.autocast(enabled=args.amp):
+                    real_outputs = discriminator(wav)
+                    fake_outputs = discriminator(recon.detach())
+                    d_loss = discriminator_loss(real_outputs, fake_outputs)
+                opt_d.zero_grad(set_to_none=True)
+                scaler_d.scale(d_loss).backward()
+                scaler_d.unscale_(opt_d)
+                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+                scaler_d.step(opt_d)
+                scaler_d.update()
+                d_loss_val = d_loss.item()
+
+                # --- generator adversarial + feature-matching terms ---
+                with torch.cuda.amp.autocast(enabled=args.amp):
+                    fake_outputs_for_g = discriminator(recon)
+                    real_outputs_for_g = discriminator(wav)
+                    g_adv = generator_adversarial_loss(fake_outputs_for_g)
+                    feat = feature_matching_loss(real_outputs_for_g, fake_outputs_for_g)
+                total_loss = total_loss + args.gan_weight * g_adv + args.feat_weight * feat
+                g_adv_val = g_adv.item()
+                feat_val = feat.item()
+
             opt.zero_grad(set_to_none=True)
             scaler.scale(total_loss).backward()
             scaler.unscale_(opt)
@@ -682,42 +853,60 @@ def train(args):
             running["stft"] += stft_loss.item()
             running["vq"] += vq_loss.item()
             running["total"] += total_loss.item()
+            running["d_loss"] += d_loss_val
+            running["g_adv"] += g_adv_val
+            running["feat"] += feat_val
             step += 1
 
             if step % args.log_every == 0:
                 n = args.log_every
-                print(
+                msg = (
                     f"epoch {epoch} step {step} "
                     f"total={running['total']/n:.4f} "
                     f"recon={running['recon']/n:.4f} "
                     f"stft={running['stft']/n:.4f} "
                     f"vq={running['vq']/n:.4f} "
-                    f"lr={scheduler.get_last_lr()[0]:.2e}"
                 )
+                if args.use_gan:
+                    msg += (
+                        f"d_loss={running['d_loss']/n:.4f} "
+                        f"g_adv={running['g_adv']/n:.4f} "
+                        f"feat={running['feat']/n:.4f} "
+                    )
+                msg += f"lr={scheduler.get_last_lr()[0]:.2e}"
+                print(msg)
                 running = {k: 0.0 for k in running}
 
         ckpt_path = os.path.join(args.out_dir, f"codec_epoch{epoch:04d}.pt")
-        torch.save({
-            "model": model.state_dict(),
+        ckpt_dict = {
+            "model": {k.replace("_orig_mod.", "", 1): v for k, v in model.state_dict().items()},
             "optimizer": opt.state_dict(),
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
             "cfg": cfg,
             "epoch": epoch,
             "step": step,
-        }, ckpt_path)
+        }
+        if args.use_gan:
+            ckpt_dict["discriminator"] = discriminator.state_dict()
+            ckpt_dict["opt_d"] = opt_d.state_dict()
+        torch.save(ckpt_dict, ckpt_path)
         print(f"Saved checkpoint: {ckpt_path}")
 
     final_path = os.path.join(args.out_dir, "codec_final.pt")
-    torch.save({
-        "model": model.state_dict(),
+    final_dict = {
+        "model": {k.replace("_orig_mod.", "", 1): v for k, v in model.state_dict().items()},
         "optimizer": opt.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
         "cfg": cfg,
         "epoch": args.epochs - 1,
         "step": step,
-    }, final_path)
+    }
+    if args.use_gan:
+        final_dict["discriminator"] = discriminator.state_dict()
+        final_dict["opt_d"] = opt_d.state_dict()
+    torch.save(final_dict, final_path)
     print(f"Training complete. Final model: {final_path}")
 
 
@@ -754,6 +943,11 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--amp", action="store_true", help="Use mixed precision training")
+    p.add_argument("--compile", action="store_true",
+                    help="Wrap the model in torch.compile() for a often-large (20-40%%) free "
+                         "speedup on modern GPUs/torch versions. First few steps are slower "
+                         "(compilation warmup); worth it for anything beyond a very short run. "
+                         "Skips silently if compilation fails on your setup.")
 
     # model size / bitrate knobs
     p.add_argument("--base_channels", type=int, default=24)
@@ -771,6 +965,20 @@ def parse_args():
     p.add_argument("--recon_weight", type=float, default=1.0)
     p.add_argument("--stft_weight", type=float, default=1.0)
     p.add_argument("--vq_weight", type=float, default=0.25)
+
+    # adversarial (GAN) training -- the main lever for reducing blurriness
+    # that reconstruction-only (L1 + STFT) losses tend to produce
+    p.add_argument("--use_gan", action="store_true",
+                    help="Add a multi-scale waveform discriminator + adversarial + "
+                         "feature-matching losses. Recommended if output sounds blurry/"
+                         "fuzzy/over-smoothed. Discriminator is only used during training "
+                         "and does not affect the exported codec's size.")
+    p.add_argument("--disc_lr", type=float, default=2e-4, help="Discriminator learning rate")
+    p.add_argument("--gan_weight", type=float, default=1.0,
+                    help="Weight on the generator's adversarial loss term")
+    p.add_argument("--feat_weight", type=float, default=2.0,
+                    help="Weight on the feature-matching loss term (usually the single "
+                         "biggest contributor to perceived sharpness/detail)")
 
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
